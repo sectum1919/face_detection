@@ -57,7 +57,73 @@ class RetinaFacePredictor(object):
         return SimpleNamespace(top_k=top_k, conf_thresh=conf_thresh, nms_thresh=nms_thresh, nms_top_k=nms_top_k)
 
     @torch.no_grad()
-    def __call__(self, image: np.ndarray, rgb: bool = True) -> np.ndarray:
+    def __call__(self, image: np.ndarray, rgb: bool = True, old=False) -> np.ndarray:
+        if old:
+            old_rets = []
+            for img in image:
+                old_rets.append(self.old_call(img, rgb=rgb))
+            return old_rets
+        
+        _, im_height, im_width, _ = image.shape
+        if rgb:
+            image = image[..., ::-1]
+        imgs = []
+        for i in image:
+            i = i.astype(int) - np.array([104, 117, 123])
+            i = i.transpose(2, 0, 1)
+            imgs.append(i)
+            
+        image = torch.from_numpy(np.array(imgs)).float().to(self.device)
+        scale = torch.Tensor([im_width, im_height, im_width, im_height]).to(self.device)
+        loc, conf, landms = self.net(image)
+        image_size = (im_height, im_width)
+        if self.priors is None or self.previous_size != image_size:
+            self.priors = PriorBox(self.config.__dict__, image_size=image_size).forward().to(self.device)
+            self.previous_size = image_size
+        prior_data = self.priors.data
+        
+        rets = []
+        for i in range(loc.shape[0]):
+            boxes = decode(loc[i].data, prior_data, self.config.variance)
+            boxes = boxes * scale
+            boxes = boxes.cpu().numpy()
+            scores = conf[i].data.cpu().numpy()[:, 1]
+            landmark_local = decode_landm(landms[i].data, prior_data, self.config.variance)
+            scale1 = torch.Tensor([image.shape[3], image.shape[2], image.shape[3], image.shape[2],
+                                image.shape[3], image.shape[2], image.shape[3], image.shape[2],
+                                image.shape[3], image.shape[2]]).to(self.device)
+            landmark_local = landmark_local * scale1
+            landmark_local = landmark_local.cpu().numpy()
+
+            # ignore low scores
+            inds = np.where(scores > self.config.conf_thresh)[0]
+            if len(inds) == 0:
+                return np.empty(shape=(0, 15), dtype=np.float32)
+            boxes = boxes[inds]
+            landmark_local = landmark_local[inds]
+            scores = scores[inds]
+
+            # do NMS
+            dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+            keep = py_cpu_nms(dets, self.config.nms_thresh, self.config.nms_top_k)
+            dets = dets[keep, :]
+            landmark_local = landmark_local[keep]
+
+            # keep top-K
+            dets = dets[:self.config.top_k, :]
+            landmark_local = landmark_local[:self.config.top_k, :]
+            dets = np.concatenate((dets, landmark_local), axis=1)
+
+            # further filter by confidence
+            inds = np.where(dets[:, 4] >= self.threshold)[0]
+            if len(inds) == 0:
+                rets.append(np.empty(shape=(0, 15), dtype=np.float32))
+            else:
+                rets.append(dets[inds])
+        return rets
+        
+    @torch.no_grad()
+    def old_call(self, image: np.ndarray, rgb: bool = True) -> np.ndarray:
         im_height, im_width, _ = image.shape
         if rgb:
             image = image[..., ::-1]
@@ -107,3 +173,56 @@ class RetinaFacePredictor(object):
             return np.empty(shape=(0, 15), dtype=np.float32)
         else:
             return dets[inds]
+        
+    # @torch.no_grad()
+    # def __call__(self, image: np.ndarray, rgb: bool = True) -> np.ndarray:
+    #     im_height, im_width, _ = image.shape
+    #     if rgb:
+    #         image = image[..., ::-1]
+    #     image = image.astype(int) - np.array([104, 117, 123])
+    #     image = image.transpose(2, 0, 1)
+    #     image = torch.from_numpy(image).unsqueeze(0).float().to(self.device)
+    #     scale = torch.Tensor([im_width, im_height, im_width, im_height]).to(self.device)
+    #     loc, conf, landms = self.net(image)
+    #     image_size = (im_height, im_width)
+    #     if self.priors is None or self.previous_size != image_size:
+    #         self.priors = PriorBox(self.config.__dict__, image_size=image_size).forward().to(self.device)
+    #         self.previous_size = image_size
+    #     prior_data = self.priors.data
+    #     boxes = decode(loc.data.squeeze(0), prior_data, self.config.variance)
+    #     boxes = boxes * scale
+    #     boxes = boxes.cpu().numpy()
+    #     scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
+    #     landms = decode_landm(landms.data.squeeze(0), prior_data, self.config.variance)
+    #     scale1 = torch.Tensor([image.shape[3], image.shape[2], image.shape[3], image.shape[2],
+    #                            image.shape[3], image.shape[2], image.shape[3], image.shape[2],
+    #                            image.shape[3], image.shape[2]]).to(self.device)
+    #     landms = landms * scale1
+    #     landms = landms.cpu().numpy()
+
+    #     # ignore low scores
+    #     inds = np.where(scores > self.config.conf_thresh)[0]
+    #     if len(inds) == 0:
+    #         return np.empty(shape=(0, 15), dtype=np.float32)
+    #     boxes = boxes[inds]
+    #     landms = landms[inds]
+    #     scores = scores[inds]
+
+    #     # do NMS
+    #     dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+    #     keep = py_cpu_nms(dets, self.config.nms_thresh, self.config.nms_top_k)
+    #     dets = dets[keep, :]
+    #     landms = landms[keep]
+
+    #     # keep top-K
+    #     dets = dets[:self.config.top_k, :]
+    #     landms = landms[:self.config.top_k, :]
+    #     dets = np.concatenate((dets, landms), axis=1)
+
+    #     # further filter by confidence
+    #     inds = np.where(dets[:, 4] >= self.threshold)[0]
+    #     if len(inds) == 0:
+    #         return np.empty(shape=(0, 15), dtype=np.float32)
+    #     else:
+    #         return dets[inds]
+
